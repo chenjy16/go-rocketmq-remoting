@@ -1,47 +1,80 @@
 package remoting
 
 import (
-	"bufio"
 	"context"
-	"fmt"
-	"net"
 	"sync"
 	"time"
 
 	client "github.com/chenjy16/go-rocketmq-remoting/client"
+	"github.com/chenjy16/go-rocketmq-remoting/command"
+	"github.com/chenjy16/go-rocketmq-remoting/errors"
 	server "github.com/chenjy16/go-rocketmq-remoting/server"
 )
 
-// ========== PROTOCOL DEFINITIONS (merged from protocol package) ==========
+// ========== REQUEST CODES ==========
 
-// DataVersion 数据版本
-type DataVersion struct {
-	Timestamp int64 `json:"timestamp"`
-	Counter   int64 `json:"counter"`
-}
+// RequestCode 请求码
+type RequestCode = command.RequestCode
 
-// TopicConfig Topic配置
-type TopicConfig struct {
-	TopicName       string `json:"topicName"`
-	ReadQueueNums   int32  `json:"readQueueNums"`
-	WriteQueueNums  int32  `json:"writeQueueNums"`
-	Perm            int32  `json:"perm"`
-	TopicFilterType int32  `json:"topicFilterType"`
-	TopicSysFlag    int32  `json:"topicSysFlag"`
-	Order           bool   `json:"order"`
-}
+// ResponseCode 响应码
+type ResponseCode = command.ResponseCode
 
-// TopicConfigSerializeWrapper Topic配置序列化包装器
-type TopicConfigSerializeWrapper struct {
-	TopicConfigTable map[string]*TopicConfig `json:"topicConfigTable"`
-	DataVersion      *DataVersion            `json:"dataVersion"`
-}
+const (
+	// Request Codes
+	SendMessage              = command.SendMessage
+	PullMessage              = command.PullMessage
+	QueryMessage             = command.QueryMessage
+	QueryMessageByKey        = command.QueryMessageByKey
+	UpdateAndCreateTopic     = command.UpdateAndCreateTopic
+	GetRouteInfoByTopic      = command.GetRouteInfoByTopic
+	GetBrokerClusterInfo     = command.GetBrokerClusterInfo
+	RegisterBroker           = command.RegisterBroker
+	UnregisterBroker         = command.UnregisterBroker
+	SendMessageV2            = command.SendMessageV2
+	SendBatchMessage         = command.SendBatchMessage
+	CheckTransactionState    = command.CheckTransactionState
+	NotifyConsumerIdsChanged = command.NotifyConsumerIdsChanged
+	LockBatchMQ              = command.LockBatchMQ
+	UnlockBatchMQ            = command.UnlockBatchMQ
+	GetAllTopicConfig        = command.GetAllTopicConfig
+	UpdateBrokerConfig       = command.UpdateBrokerConfig
+	GetBrokerConfig          = command.GetBrokerConfig
+	SearchOffsetByTimestamp  = command.SearchOffsetByTimestamp
+	GetMaxOffset             = command.GetMaxOffset
+	GetMinOffset             = command.GetMinOffset
+	HeartBeat                = command.HeartBeat
+	UnregisterClient         = command.UnregisterClient
+	ConsumerSendMsgBack      = command.ConsumerSendMsgBack
+	UpdateConsumerOffset     = command.UpdateConsumerOffset
+	EndTransaction           = command.EndTransaction
+	GetConsumerListByGroup   = command.GetConsumerListByGroup
+	CheckClientConfig        = command.CheckClientConfig
 
-// RegisterBrokerResult Broker注册结果
-type RegisterBrokerResult struct {
-	HaServerAddr string `json:"haServerAddr"`
-	MasterAddr   string `json:"masterAddr"`
-}
+	Success                   = command.Success
+	SystemError               = command.SystemError
+	SystemBusy                = command.SystemBusy
+	RequestCodeNotSupported   = command.RequestCodeNotSupported
+	TransactionFailed         = command.TransactionFailed
+	FlushDiskTimeout          = command.FlushDiskTimeout
+	SlaveNotAvailable         = command.SlaveNotAvailable
+	FlushSlaveTimeout         = command.FlushSlaveTimeout
+	MessageIllegal            = command.MessageIllegal
+	ServiceNotAvailable       = command.ServiceNotAvailable
+	VersionNotSupported       = command.VersionNotSupported
+	NoPermission              = command.NoPermission
+	TopicNotExist             = command.TopicNotExist
+	TopicExistAlready         = command.TopicExistAlready
+	PullNotFound              = command.PullNotFound
+	PullRetryImmediately      = command.PullRetryImmediately
+	PullOffsetMoved           = command.PullOffsetMoved
+	QueryNotFound             = command.QueryNotFound
+	SubscriptionParseFailed   = command.SubscriptionParseFailed
+	SubscriptionNotExist      = command.SubscriptionNotExist
+	SubscriptionNotLatest     = command.SubscriptionNotLatest
+	SubscriptionGroupNotExist = command.SubscriptionGroupNotExist
+)
+
+// ========== DATA STRUCTURES ==========
 
 // TopicRouteData Topic路由数据
 type TopicRouteData struct {
@@ -67,135 +100,11 @@ type BrokerData struct {
 	BrokerAddrs map[int64]string `json:"brokerAddrs"`
 }
 
-// ClusterInfo 集群信息
-type ClusterInfo struct {
-	BrokerAddrTable  map[string]map[int64]string `json:"brokerAddrTable"`
-	ClusterAddrTable map[string][]string         `json:"clusterAddrTable"`
+// DataVersion 数据版本
+type DataVersion struct {
+	Timestamp int64 `json:"timestamp"`
+	Counter   int64 `json:"counter"`
 }
-
-// RequestCode 请求码
-type RequestCode int32
-
-const (
-	// NameServer相关
-	UpdateAndCreateTopic        RequestCode = 17
-	GetRouteInfoByTopic         RequestCode = 105
-	GetBrokerClusterInfo        RequestCode = 106
-	RegisterBroker              RequestCode = 103
-	UnregisterBroker            RequestCode = 104
-	GetAllTopicConfig           RequestCode = 21
-	GetTopicConfigList          RequestCode = 22
-	GetTopicNameList            RequestCode = 23
-	UpdateAndCreateTopicRequest RequestCode = 24
-
-	// Producer相关
-	SendMessage         RequestCode = 10
-	SendMessageV2       RequestCode = 310
-	SendBatchMessage    RequestCode = 320
-	ConsumerSendMsgBack RequestCode = 36
-
-	// Consumer相关
-	PullMessage                  RequestCode = 11
-	QueryMessage                 RequestCode = 12
-	QueryMessageByKey            RequestCode = 33
-	QueryMessageById             RequestCode = 34
-	UpdateConsumerOffset         RequestCode = 34 // Same as QueryMessageById
-	UpdateConsumerOffsetInBroker RequestCode = 35
-	ConsumeMessageDirectly       RequestCode = 38
-
-	// Transaction相关
-	EndTransaction           RequestCode = 37
-	CheckTransactionState    RequestCode = 39
-	NotifyConsumerIdsChanged RequestCode = 40
-	CheckClientConfig        RequestCode = 41
-
-	// Admin相关
-	UpdateBrokerConfig                RequestCode = 25
-	GetBrokerConfig                   RequestCode = 26
-	SearchOffsetByTimestamp           RequestCode = 29
-	GetMaxOffset                      RequestCode = 30
-	GetMinOffset                      RequestCode = 31
-	GetEarliestMsgStoretime           RequestCode = 32
-	ViewMessageById                   RequestCode = 43
-	HeartBeat                         RequestCode = 31 // Same as GetMinOffset
-	UNREGISTER_CLIENT                 RequestCode = 35 // Same as UpdateConsumerOffsetInBroker
-	GET_CONSUMER_LIST_BY_GROUP        RequestCode = 44
-	CHECK_TRANSACTION_STATE           RequestCode = 39 // Same as CheckTransactionState
-	NOTIFY_CONSUMER_IDS_CHANGED       RequestCode = 40 // Same as NotifyConsumerIdsChanged
-	LOCK_BATCH_MQ                     RequestCode = 45
-	UNLOCK_BATCH_MQ                   RequestCode = 46
-	GET_ALL_TOPIC_CONFIG              RequestCode = 21 // Same as GetAllTopicConfig
-	GET_ALL_SUBSCRIPTION_GROUP_CONFIG RequestCode = 47
-	UPDATE_SUBSCRIPTION_GROUP_CONFIG  RequestCode = 48
-	DELETE_SUBSCRIPTION_GROUP_CONFIG  RequestCode = 49
-	GET_TOPIC_STATS_INFO              RequestCode = 50
-	GET_CONSUMER_CONNECTION_LIST      RequestCode = 51
-	GET_PRODUCER_CONNECTION_LIST      RequestCode = 52
-	WIPE_WRITE_PERM_OF_BROKER         RequestCode = 53
-	GET_ALL_CONSUMER_OFFSET           RequestCode = 54
-	GET_ALL_DELAY_OFFSET              RequestCode = 55
-	CHECK_CLIENT_CONFIG               RequestCode = 41 // Same as CheckClientConfig
-	GET_CLIENT_CONFIG                 RequestCode = 56
-	UPDATE_AND_CREATE_ACL_CONFIG      RequestCode = 57
-	DELETE_ACL_CONFIG                 RequestCode = 58
-	GET_BROKER_CLUSTER_ACL_INFO       RequestCode = 59
-	UPDATE_GLOBAL_WHITE_ADDRS_CONFIG  RequestCode = 60
-	RESUME_CHECK_HALF_MESSAGE         RequestCode = 61
-	SEND_REPLY_MESSAGE                RequestCode = 62
-	SEND_REPLY_MESSAGE_V2             RequestCode = 63
-	PUSH_REPLY_MESSAGE_TO_CLIENT      RequestCode = 64
-	ADD_WRITE_PERM_OF_BROKER          RequestCode = 65
-	INVOKE_BROKER_TO_CLIENT           RequestCode = 66
-)
-
-// ResponseCode 响应码
-type ResponseCode int32
-
-const (
-	Success                   ResponseCode = 0
-	SystemError               ResponseCode = 1
-	SystemBusy                ResponseCode = 2
-	RequestCodeNotSupported   ResponseCode = 3
-	TransactionFailed         ResponseCode = 4
-	FlushDiskTimeout          ResponseCode = 10
-	SlaveNotAvailable         ResponseCode = 11
-	FlushSlaveTimeout         ResponseCode = 12
-	MessageIllegal            ResponseCode = 13
-	ServiceNotAvailable       ResponseCode = 14
-	VersionNotSupported       ResponseCode = 15
-	NoPermission              ResponseCode = 16
-	TopicNotExist             ResponseCode = 17
-	TopicExistAlready         ResponseCode = 18
-	PullNotFound              ResponseCode = 19
-	PullRetryImmediately      ResponseCode = 20
-	PullOffsetMoved           ResponseCode = 21
-	QueryNotFound             ResponseCode = 22
-	SubscriptionParseFailed   ResponseCode = 23
-	SubscriptionNotExist      ResponseCode = 24
-	SubscriptionNotLatest     ResponseCode = 25
-	SubscriptionGroupNotExist ResponseCode = 26
-
-	// Additional response codes
-	ConsumerNotOnline            ResponseCode = 27
-	ConsumeMsgConcurrentlyFailed ResponseCode = 28
-	NoMessageFound               ResponseCode = 29
-	OffsetReset                  ResponseCode = 30
-	TopicAuthorizationFailed     ResponseCode = 31
-	GroupAuthorizationFailed     ResponseCode = 32
-	ClientAuthorizationFailed    ResponseCode = 33
-
-	TransactionShouldCommit    ResponseCode = 200
-	TransactionShouldRollback  ResponseCode = 201
-	TransactionStateUnknown    ResponseCode = 202
-	TransactionStateGroupWrong ResponseCode = 203
-	NoBuyerId                  ResponseCode = 204
-
-	// ACL related response codes
-	AclVerificationFailed    ResponseCode = 401
-	AclAuthorizationFailed   ResponseCode = 402
-	AclResourceNotFound      ResponseCode = 403
-	AclResourceAlreadyExists ResponseCode = 404
-)
 
 // SubscriptionData 订阅数据
 type SubscriptionData struct {
@@ -207,17 +116,39 @@ type SubscriptionData struct {
 	ExpressionType string   `json:"expressionType"`
 }
 
-// RemotingCommand 远程调用命令
-type RemotingCommand struct {
-	Code      RequestCode       `json:"code"`
-	Language  string            `json:"language"`
-	Version   int32             `json:"version"`
-	Opaque    int32             `json:"opaque"`
-	Flag      int32             `json:"flag"`
-	Remark    string            `json:"remark"`
-	ExtFields map[string]string `json:"extFields"`
-	Body      []byte            `json:"body"`
+// TopicConfig Topic配置
+type TopicConfig struct {
+	TopicName       string            `json:"topicName"`
+	ReadQueueNums   int32             `json:"readQueueNums"`
+	WriteQueueNums  int32             `json:"writeQueueNums"`
+	Perm            int32             `json:"perm"`
+	TopicFilterType string            `json:"topicFilterType"`
+	TopicSysFlag    int32             `json:"topicSysFlag"`
+	Order           bool              `json:"order"`
+	Attributes      map[string]string `json:"attributes"`
 }
+
+// TopicConfigSerializeWrapper Topic配置序列化包装器
+type TopicConfigSerializeWrapper struct {
+	TopicConfigTable map[string]*TopicConfig `json:"topicConfigTable"`
+	DataVersion      *DataVersion            `json:"dataVersion"`
+	MixAllSubscribed bool                    `json:"mixAllSubscribed"`
+}
+
+// RegisterBrokerResult 注册Broker结果
+type RegisterBrokerResult struct {
+	HaServerAddr string `json:"haServerAddr"`
+	MasterAddr   string `json:"masterAddr"`
+}
+
+// ClusterInfo 集群信息
+type ClusterInfo struct {
+	BrokerAddrTable  map[string]map[int64]string `json:"brokerAddrTable"`
+	ClusterAddrTable map[string][]string         `json:"clusterAddrTable"`
+}
+
+// RemotingCommand 远程调用命令
+type RemotingCommand = command.RemotingCommand
 
 // SendMessageRequestHeader 发送消息请求头
 type SendMessageRequestHeader struct {
@@ -337,25 +268,12 @@ func (dv *DataVersion) NextVersion() *DataVersion {
 
 // CreateRemotingCommand 创建远程调用命令
 func CreateRemotingCommand(code RequestCode) *RemotingCommand {
-	return &RemotingCommand{
-		Code:      code,
-		Language:  "GO",
-		Version:   1,
-		Flag:      0,
-		ExtFields: make(map[string]string),
-	}
+	return command.CreateRemotingCommand(code)
 }
 
 // CreateResponseCommand 创建响应命令
 func CreateResponseCommand(code ResponseCode, remark string) *RemotingCommand {
-	return &RemotingCommand{
-		Code:      RequestCode(code),
-		Language:  "GO",
-		Version:   1,
-		Flag:      1, // 响应标志
-		Remark:    remark,
-		ExtFields: make(map[string]string),
-	}
+	return command.CreateResponseCommand(code, remark)
 }
 
 // ========== REMOTING DEFINITIONS ==========
@@ -374,44 +292,10 @@ type RemotingClient struct {
 type ResponseCallback func(*RemotingCommand, error)
 
 // Connection TCP连接封装
-type Connection struct {
-	addr     string
-	conn     net.Conn
-	reader   *bufio.Reader
-	writer   *bufio.Writer
-	mutex    sync.RWMutex
-	lastUsed time.Time
-	closed   bool
-}
+type Connection = command.Connection
 
 // RemotingError 远程调用错误
-type RemotingError struct {
-	Code    int
-	Message string
-	Err     error
-}
-
-// Error 实现error接口
-func (e *RemotingError) Error() string {
-	if e.Err != nil {
-		return fmt.Sprintf("RemotingError[code=%d, message=%s]: %v", e.Code, e.Message, e.Err)
-	}
-	return fmt.Sprintf("RemotingError[code=%d, message=%s]", e.Code, e.Message)
-}
-
-// Unwrap 返回底层错误
-func (e *RemotingError) Unwrap() error {
-	return e.Err
-}
-
-// NewRemotingError 创建远程调用错误
-func NewRemotingError(code int, message string, err error) *RemotingError {
-	return &RemotingError{
-		Code:    code,
-		Message: message,
-		Err:     err,
-	}
-}
+type RemotingError = errors.RemotingError
 
 // ServerConnection 服务端连接类型别名
 type ServerConnection = server.ServerConnection
@@ -435,12 +319,12 @@ func NewRemotingClient() *RemotingClientWrapper {
 }
 
 // convertToClientCommand converts remoting.RemotingCommand to client.RemotingCommand
-func convertToClientCommand(cmd *RemotingCommand) *client.RemotingCommand {
+func convertToClientCommand(cmd *RemotingCommand) *command.RemotingCommand {
 	if cmd == nil {
 		return nil
 	}
-	return &client.RemotingCommand{
-		Code:      int32(cmd.Code),
+	return &command.RemotingCommand{
+		Code:      command.RequestCode(cmd.Code),
 		Language:  cmd.Language,
 		Version:   cmd.Version,
 		Opaque:    cmd.Opaque,
@@ -452,7 +336,7 @@ func convertToClientCommand(cmd *RemotingCommand) *client.RemotingCommand {
 }
 
 // convertFromClientCommand converts client.RemotingCommand to remoting.RemotingCommand
-func convertFromClientCommand(cmd *client.RemotingCommand) *RemotingCommand {
+func convertFromClientCommand(cmd *command.RemotingCommand) *RemotingCommand {
 	if cmd == nil {
 		return nil
 	}

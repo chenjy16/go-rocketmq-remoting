@@ -8,10 +8,10 @@ import (
 	"sync"
 	"time"
 
-	"go-rocketmq/pkg/remoting"
-	"go-rocketmq/pkg/remoting/codec"
-	"go-rocketmq/pkg/remoting/heartbeat"
-	"go-rocketmq/pkg/remoting/routing"
+	remoting "github.com/chenjy16/go-rocketmq-remoting"
+	"github.com/chenjy16/go-rocketmq-remoting/codec"
+	"github.com/chenjy16/go-rocketmq-remoting/heartbeat"
+	"github.com/chenjy16/go-rocketmq-remoting/routing"
 )
 
 // ProcessorContext 处理器上下文

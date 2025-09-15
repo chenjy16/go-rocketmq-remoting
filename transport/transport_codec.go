@@ -7,8 +7,8 @@ import (
 	"fmt"
 	"io"
 
-	"go-rocketmq/pkg/remoting"
-	"go-rocketmq/pkg/remoting/codec"
+	remoting "github.com/chenjy16/go-rocketmq-remoting"
+	"github.com/chenjy16/go-rocketmq-remoting/codec"
 )
 
 // TransportCodec 传输层编解码器

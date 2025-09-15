@@ -7,8 +7,9 @@ import (
 	"sync"
 	"time"
 
-	"go-rocketmq/pkg/remoting"
-	"go-rocketmq/pkg/remoting/client"
+	remoting "github.com/chenjy16/go-rocketmq-remoting"
+	"github.com/chenjy16/go-rocketmq-remoting/client"
+	"github.com/chenjy16/go-rocketmq-remoting/command"
 )
 
 // HeartbeatData 心跳数据
@@ -43,6 +44,17 @@ type HeartbeatManager struct {
 	ctx           context.Context
 	cancel        context.CancelFunc
 	wg            sync.WaitGroup
+	stats         *HeartbeatStats // 添加统计信息
+}
+
+// HeartbeatStats 心跳统计信息
+type HeartbeatStats struct {
+	SuccessCount    int64         // 成功心跳数
+	FailureCount    int64         // 失败心跳数
+	LastSuccessTime time.Time     // 最后成功时间
+	LastFailureTime time.Time     // 最后失败时间
+	AvgResponseTime time.Duration // 平均响应时间
+	mutex           sync.RWMutex
 }
 
 // NewHeartbeatManager 创建心跳管理器
@@ -58,6 +70,7 @@ func NewHeartbeatManager(client *client.RemotingClient, clientID string) *Heartb
 		interval: 30 * time.Second, // 默认30秒心跳间隔
 		ctx:      ctx,
 		cancel:   cancel,
+		stats:    &HeartbeatStats{},
 	}
 }
 
@@ -193,9 +206,12 @@ func (hm *HeartbeatManager) sendHeartbeatToAllBrokers() {
 
 // sendHeartbeatToBroker 向指定Broker发送心跳
 func (hm *HeartbeatManager) sendHeartbeatToBroker(brokerAddr string, heartbeatData *HeartbeatData) {
+	startTime := time.Now()
+
 	// 序列化心跳数据
 	body, err := json.Marshal(heartbeatData)
 	if err != nil {
+		hm.updateStats(false, time.Since(startTime))
 		return
 	}
 
@@ -204,8 +220,8 @@ func (hm *HeartbeatManager) sendHeartbeatToBroker(brokerAddr string, heartbeatDa
 	request.Body = body
 
 	// 转换为客户端RemotingCommand类型
-	clientRequest := &client.RemotingCommand{
-		Code:      int32(request.Code),
+	clientRequest := &command.RemotingCommand{
+		Code:      command.RequestCode(request.Code),
 		Language:  request.Language,
 		Version:   request.Version,
 		Opaque:    request.Opaque,
@@ -216,11 +232,90 @@ func (hm *HeartbeatManager) sendHeartbeatToBroker(brokerAddr string, heartbeatDa
 	}
 
 	// 发送心跳（单向发送，不等待响应）
-	hm.client.SendOneway(brokerAddr, clientRequest)
+	err = hm.client.SendOneway(brokerAddr, clientRequest)
+
+	// 更新统计信息
+	hm.updateStats(err == nil, time.Since(startTime))
+}
+
+// updateStats 更新统计信息
+func (hm *HeartbeatManager) updateStats(success bool, responseTime time.Duration) {
+	hm.stats.mutex.Lock()
+	defer hm.stats.mutex.Unlock()
+
+	if success {
+		hm.stats.SuccessCount++
+		hm.stats.LastSuccessTime = time.Now()
+		// 更新平均响应时间
+		if hm.stats.AvgResponseTime == 0 {
+			hm.stats.AvgResponseTime = responseTime
+		} else {
+			hm.stats.AvgResponseTime = (hm.stats.AvgResponseTime + responseTime) / 2
+		}
+	} else {
+		hm.stats.FailureCount++
+		hm.stats.LastFailureTime = time.Now()
+	}
+}
+
+// GetStats 获取心跳统计信息
+func (hm *HeartbeatManager) GetStats() *HeartbeatStats {
+	hm.stats.mutex.RLock()
+	defer hm.stats.mutex.RUnlock()
+
+	// 返回统计信息的副本
+	return &HeartbeatStats{
+		SuccessCount:    hm.stats.SuccessCount,
+		FailureCount:    hm.stats.FailureCount,
+		LastSuccessTime: hm.stats.LastSuccessTime,
+		LastFailureTime: hm.stats.LastFailureTime,
+		AvgResponseTime: hm.stats.AvgResponseTime,
+	}
+}
+
+// ResetStats 重置统计信息
+func (hm *HeartbeatManager) ResetStats() {
+	hm.stats.mutex.Lock()
+	defer hm.stats.mutex.Unlock()
+
+	hm.stats.SuccessCount = 0
+	hm.stats.FailureCount = 0
+	hm.stats.LastSuccessTime = time.Time{}
+	hm.stats.LastFailureTime = time.Time{}
+	hm.stats.AvgResponseTime = 0
+}
+
+// SetHeartbeatInterval 设置心跳间隔
+func (hm *HeartbeatManager) SetHeartbeatInterval(interval time.Duration) {
+	hm.mutex.Lock()
+	defer hm.mutex.Unlock()
+	hm.interval = interval
+}
+
+// GetHeartbeatInterval 获取心跳间隔
+func (hm *HeartbeatManager) GetHeartbeatInterval() time.Duration {
+	hm.mutex.RLock()
+	defer hm.mutex.RUnlock()
+	return hm.interval
+}
+
+// GetHeartbeatData 获取心跳数据
+func (hm *HeartbeatManager) GetHeartbeatData() *HeartbeatData {
+	hm.mutex.RLock()
+	defer hm.mutex.RUnlock()
+	return hm.cloneHeartbeatData()
+}
+
+// SendHeartbeatNow 立即发送心跳
+func (hm *HeartbeatManager) SendHeartbeatNow() {
+	hm.sendHeartbeatToAllBrokers()
 }
 
 // cloneHeartbeatData 克隆心跳数据
 func (hm *HeartbeatManager) cloneHeartbeatData() *HeartbeatData {
+	hm.mutex.RLock()
+	defer hm.mutex.RUnlock()
+
 	data := &HeartbeatData{
 		ClientID:        hm.heartbeatData.ClientID,
 		ProducerDataSet: make([]*ProducerData, len(hm.heartbeatData.ProducerDataSet)),
@@ -261,41 +356,25 @@ func (hm *HeartbeatManager) cloneHeartbeatData() *HeartbeatData {
 	return data
 }
 
-// SetHeartbeatInterval 设置心跳间隔
-func (hm *HeartbeatManager) SetHeartbeatInterval(interval time.Duration) {
-	hm.mutex.Lock()
-	defer hm.mutex.Unlock()
-	hm.interval = interval
-}
-
-// GetHeartbeatData 获取心跳数据
-func (hm *HeartbeatManager) GetHeartbeatData() *HeartbeatData {
-	hm.mutex.RLock()
-	defer hm.mutex.RUnlock()
-	return hm.cloneHeartbeatData()
-}
-
-// SendHeartbeatNow 立即发送心跳
-func (hm *HeartbeatManager) SendHeartbeatNow() {
-	hm.sendHeartbeatToAllBrokers()
-}
-
 // HeartbeatProcessor 心跳处理器（用于服务端）
 type HeartbeatProcessor struct {
-	clientTable sync.Map // map[string]*ClientChannelInfo
+	clientTable sync.Map                 // map[string]*ClientChannelInfo
+	stats       *HeartbeatProcessorStats // 添加统计信息
 }
 
-// ClientChannelInfo 客户端通道信息
-type ClientChannelInfo struct {
-	ClientID      string
-	RemoteAddr    string
-	LastUpdate    time.Time
-	HeartbeatData *HeartbeatData
+// HeartbeatProcessorStats 心跳处理器统计信息
+type HeartbeatProcessorStats struct {
+	TotalHeartbeats   int64     // 总心跳数
+	LastHeartbeatTime time.Time // 最后心跳时间
+	ActiveClients     int64     // 活跃客户端数
+	mutex             sync.RWMutex
 }
 
 // NewHeartbeatProcessor 创建心跳处理器
 func NewHeartbeatProcessor() *HeartbeatProcessor {
-	return &HeartbeatProcessor{}
+	return &HeartbeatProcessor{
+		stats: &HeartbeatProcessorStats{},
+	}
 }
 
 // ProcessRequest 处理心跳请求
@@ -316,9 +395,50 @@ func (hp *HeartbeatProcessor) ProcessRequest(ctx context.Context, request *remot
 
 	hp.clientTable.Store(heartbeatData.ClientID, clientInfo)
 
+	// 更新统计信息
+	hp.updateStats()
+
 	// 返回成功响应
 	response := remoting.CreateResponseCommand(remoting.Success, "")
 	return response, nil
+}
+
+// updateStats 更新统计信息
+func (hp *HeartbeatProcessor) updateStats() {
+	hp.stats.mutex.Lock()
+	defer hp.stats.mutex.Unlock()
+
+	hp.stats.TotalHeartbeats++
+	hp.stats.LastHeartbeatTime = time.Now()
+
+	// 更新活跃客户端数
+	var count int64
+	hp.clientTable.Range(func(key, value interface{}) bool {
+		count++
+		return true
+	})
+	hp.stats.ActiveClients = count
+}
+
+// GetStats 获取处理器统计信息
+func (hp *HeartbeatProcessor) GetStats() *HeartbeatProcessorStats {
+	hp.stats.mutex.RLock()
+	defer hp.stats.mutex.RUnlock()
+
+	// 返回统计信息的副本
+	return &HeartbeatProcessorStats{
+		TotalHeartbeats:   hp.stats.TotalHeartbeats,
+		LastHeartbeatTime: hp.stats.LastHeartbeatTime,
+		ActiveClients:     hp.stats.ActiveClients,
+	}
+}
+
+// ClientChannelInfo 客户端通道信息
+type ClientChannelInfo struct {
+	ClientID      string
+	RemoteAddr    string
+	LastUpdate    time.Time
+	HeartbeatData *HeartbeatData
 }
 
 // GetClientInfo 获取客户端信息

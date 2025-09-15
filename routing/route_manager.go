@@ -9,7 +9,7 @@ import (
 	"sync"
 	"time"
 
-	"go-rocketmq/pkg/remoting"
+	remoting "github.com/chenjy16/go-rocketmq-remoting"
 )
 
 // RouteManager 路由管理器

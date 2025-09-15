@@ -643,3 +643,207 @@ func (mc *MessageCodec) GetMessageSysFlag(msg *Message) int32 {
 func (mc *MessageCodec) SetMessageSysFlag(msg *Message, sysFlag int32) {
 	mc.SetMessageProperty(msg, "SYS_FLAG", strconv.FormatInt(int64(sysFlag), 10))
 }
+
+// MessageHeader 消息头
+type MessageHeader struct {
+	MagicCode     int32  `json:"magicCode"`
+	Version       int16  `json:"version"`
+	HeaderLength  int32  `json:"headerLength"`
+	Code          int32  `json:"code"`
+	Flag          int32  `json:"flag"`
+	RemarkLength  int32  `json:"remarkLength"`
+	ExtFieldsSize int32  `json:"extFieldsSize"`
+	BodyLength    int32  `json:"bodyLength"`
+	TopicLength   int8   `json:"topicLength"`
+	Topic         string `json:"topic"`
+}
+
+// StandardMessageCodec 标准化消息编解码器
+type StandardMessageCodec struct {
+	MessageCodec
+}
+
+// NewStandardMessageCodec 创建标准化消息编解码器
+func NewStandardMessageCodec() *StandardMessageCodec {
+	return &StandardMessageCodec{
+		MessageCodec: *NewMessageCodec(),
+	}
+}
+
+// EncodeStandardMessage 编码标准化消息
+func (smc *StandardMessageCodec) EncodeStandardMessage(msg *Message, requestCode int32, remark string) ([]byte, error) {
+	if msg == nil {
+		return nil, fmt.Errorf("message is nil")
+	}
+
+	// 验证消息
+	if err := smc.ValidateMessage(msg); err != nil {
+		return nil, fmt.Errorf("invalid message: %v", err)
+	}
+
+	// 构建消息头
+	header := &MessageHeader{
+		MagicCode:   0x7ABBCCDD,
+		Version:     1,
+		Code:        requestCode,
+		Flag:        msg.Flag,
+		Topic:       msg.Topic,
+		TopicLength: int8(len(msg.Topic)),
+	}
+
+	// 计算备注长度
+	if remark != "" {
+		header.RemarkLength = int32(len(remark))
+	}
+
+	// 计算扩展字段大小
+	var extFieldsData []byte
+	if len(msg.Properties) > 0 {
+		extFieldsData = smc.encodeProperties(msg.Properties)
+		header.ExtFieldsSize = int32(len(extFieldsData))
+	}
+
+	// 计算消息体长度
+	header.BodyLength = int32(len(msg.Body))
+
+	// 计算消息头长度
+	header.HeaderLength = int32(4 + 2 + 4 + 4 + 4 + 4 + 4 + 4 + 1 + len(header.Topic))
+
+	// 计算总长度
+	totalLen := 4 + header.HeaderLength + header.RemarkLength + header.ExtFieldsSize + header.BodyLength
+
+	// 创建缓冲区
+	buf := bytes.NewBuffer(make([]byte, 0, totalLen))
+
+	// 写入总长度（不包括这4个字节）
+	binary.Write(buf, binary.BigEndian, int32(totalLen-4))
+
+	// 写入消息头
+	binary.Write(buf, binary.BigEndian, header.MagicCode)
+	binary.Write(buf, binary.BigEndian, header.Version)
+	binary.Write(buf, binary.BigEndian, header.HeaderLength)
+	binary.Write(buf, binary.BigEndian, header.Code)
+	binary.Write(buf, binary.BigEndian, header.Flag)
+	binary.Write(buf, binary.BigEndian, header.RemarkLength)
+	binary.Write(buf, binary.BigEndian, header.ExtFieldsSize)
+	binary.Write(buf, binary.BigEndian, header.BodyLength)
+	binary.Write(buf, binary.BigEndian, header.TopicLength)
+	buf.WriteString(header.Topic)
+
+	// 写入备注
+	if remark != "" {
+		buf.WriteString(remark)
+	}
+
+	// 写入扩展字段
+	if len(extFieldsData) > 0 {
+		buf.Write(extFieldsData)
+	}
+
+	// 写入消息体
+	buf.Write(msg.Body)
+
+	return buf.Bytes(), nil
+}
+
+// DecodeStandardMessage 解码标准化消息
+func (smc *StandardMessageCodec) DecodeStandardMessage(data []byte) (*Message, int32, string, error) {
+	if len(data) < 24 { // 最小消息长度
+		return nil, 0, "", fmt.Errorf("message data too short")
+	}
+
+	reader := bytes.NewReader(data)
+
+	// 读取总长度
+	var totalLen int32
+	if err := binary.Read(reader, binary.BigEndian, &totalLen); err != nil {
+		return nil, 0, "", fmt.Errorf("failed to read total length: %v", err)
+	}
+
+	// 读取消息头
+	header := &MessageHeader{}
+	if err := binary.Read(reader, binary.BigEndian, &header.MagicCode); err != nil {
+		return nil, 0, "", fmt.Errorf("failed to read magic code: %v", err)
+	}
+	if header.MagicCode != 0x7ABBCCDD {
+		return nil, 0, "", fmt.Errorf("invalid magic code: %x", header.MagicCode)
+	}
+
+	if err := binary.Read(reader, binary.BigEndian, &header.Version); err != nil {
+		return nil, 0, "", fmt.Errorf("failed to read version: %v", err)
+	}
+
+	if err := binary.Read(reader, binary.BigEndian, &header.HeaderLength); err != nil {
+		return nil, 0, "", fmt.Errorf("failed to read header length: %v", err)
+	}
+
+	if err := binary.Read(reader, binary.BigEndian, &header.Code); err != nil {
+		return nil, 0, "", fmt.Errorf("failed to read code: %v", err)
+	}
+
+	if err := binary.Read(reader, binary.BigEndian, &header.Flag); err != nil {
+		return nil, 0, "", fmt.Errorf("failed to read flag: %v", err)
+	}
+
+	if err := binary.Read(reader, binary.BigEndian, &header.RemarkLength); err != nil {
+		return nil, 0, "", fmt.Errorf("failed to read remark length: %v", err)
+	}
+
+	if err := binary.Read(reader, binary.BigEndian, &header.ExtFieldsSize); err != nil {
+		return nil, 0, "", fmt.Errorf("failed to read ext fields size: %v", err)
+	}
+
+	if err := binary.Read(reader, binary.BigEndian, &header.BodyLength); err != nil {
+		return nil, 0, "", fmt.Errorf("failed to read body length: %v", err)
+	}
+
+	if err := binary.Read(reader, binary.BigEndian, &header.TopicLength); err != nil {
+		return nil, 0, "", fmt.Errorf("failed to read topic length: %v", err)
+	}
+
+	topicData := make([]byte, header.TopicLength)
+	if _, err := reader.Read(topicData); err != nil {
+		return nil, 0, "", fmt.Errorf("failed to read topic: %v", err)
+	}
+	header.Topic = string(topicData)
+
+	// 读取备注
+	var remark string
+	if header.RemarkLength > 0 {
+		remarkData := make([]byte, header.RemarkLength)
+		if _, err := reader.Read(remarkData); err != nil {
+			return nil, 0, "", fmt.Errorf("failed to read remark: %v", err)
+		}
+		remark = string(remarkData)
+	}
+
+	// 读取扩展字段
+	var properties map[string]string
+	if header.ExtFieldsSize > 0 {
+		extFieldsData := make([]byte, header.ExtFieldsSize)
+		if _, err := reader.Read(extFieldsData); err != nil {
+			return nil, 0, "", fmt.Errorf("failed to read ext fields: %v", err)
+		}
+		properties = smc.decodeProperties(extFieldsData)
+	} else {
+		properties = make(map[string]string)
+	}
+
+	// 读取消息体
+	var body []byte
+	if header.BodyLength > 0 {
+		body = make([]byte, header.BodyLength)
+		if _, err := reader.Read(body); err != nil {
+			return nil, 0, "", fmt.Errorf("failed to read body: %v", err)
+		}
+	}
+
+	message := &Message{
+		Topic:      header.Topic,
+		Flag:       header.Flag,
+		Properties: properties,
+		Body:       body,
+	}
+
+	return message, header.Code, remark, nil
+}

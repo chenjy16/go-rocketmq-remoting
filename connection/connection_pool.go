@@ -1,12 +1,15 @@
 package connection
 
 import (
+	"bufio"
 	"context"
 	"fmt"
 	"net"
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/chenjy16/go-rocketmq-remoting/command"
 )
 
 // ConnectionPoolError 连接池错误
@@ -53,8 +56,7 @@ func NewConnectionPoolError(code int, message string, err error) *ConnectionPool
 
 // ConnectionPool 连接池
 type ConnectionPool struct {
-	// client is managed by the RemotingClient
-	connections    sync.Map // map[string]*PooledConnection
+	connections    sync.Map // map[string]*command.Connection
 	maxConnections int32
 	currentCount   int32
 	maxIdleTime    time.Duration
@@ -70,6 +72,12 @@ type ConnectionPool struct {
 
 	// 指标收集
 	metrics *ConnectionPoolMetrics
+
+	// 熔断器映射
+	circuitBreakers sync.Map // map[string]*CircuitBreaker
+
+	// 连接使用计数
+	connectionUseCount sync.Map // map[string]*int64
 }
 
 // ConnectionPoolErrorConfig 连接池错误处理配置
@@ -78,6 +86,7 @@ type ConnectionPoolErrorConfig struct {
 	RetryInterval           time.Duration // 重试间隔
 	EnableCircuitBreaker    bool          // 是否启用熔断器
 	CircuitBreakerThreshold int           // 熔断器阈值
+	CircuitBreakerTimeout   time.Duration // 熔断器超时时间
 }
 
 // DefaultConnectionPoolErrorConfig 默认连接池错误处理配置
@@ -86,6 +95,7 @@ var DefaultConnectionPoolErrorConfig = &ConnectionPoolErrorConfig{
 	RetryInterval:           1 * time.Second,
 	EnableCircuitBreaker:    true,
 	CircuitBreakerThreshold: 5,
+	CircuitBreakerTimeout:   30 * time.Second,
 }
 
 // ConnectionPoolMetrics 连接池指标
@@ -98,22 +108,6 @@ type ConnectionPoolMetrics struct {
 	AvgConnectionTime  time.Duration // 平均连接时间
 	ErrorCountByCode   map[int]int64 // 按错误代码统计
 	mutex              sync.RWMutex
-}
-
-// PooledConnection 池化连接
-type PooledConnection struct {
-	addr        string
-	conn        net.Conn
-	lastUsed    time.Time
-	useCount    int64
-	mutex       sync.RWMutex
-	closed      bool
-	createdTime time.Time
-
-	// 连接状态
-	lastError     error
-	errorCount    int32
-	lastErrorTime time.Time
 }
 
 // ConnectionPoolConfig 连接池配置
@@ -177,7 +171,7 @@ func NewConnectionPool(config *ConnectionPoolConfig) *ConnectionPool {
 }
 
 // GetConnection 获取连接
-func (cp *ConnectionPool) GetConnection(addr string) (*PooledConnection, error) {
+func (cp *ConnectionPool) GetConnection(addr string) (*command.Connection, error) {
 	if atomic.LoadInt32(&cp.closed) == 1 {
 		return nil, NewConnectionPoolError(ErrCodePoolClosed, "connection pool is closed", nil)
 	}
@@ -193,46 +187,89 @@ func (cp *ConnectionPool) GetConnection(addr string) (*PooledConnection, error) 
 		cp.metrics.incrementTotalConnections()
 	}()
 
-	// 重试机制
-	var lastErr error
-	for attempt := 0; attempt <= cp.errorConfig.MaxRetryAttempts; attempt++ {
-		if attempt > 0 {
-			// 记录重试
-			cp.metrics.incrementRetryConnections()
-			time.Sleep(cp.errorConfig.RetryInterval)
+	// 检查熔断器
+	if cp.errorConfig.EnableCircuitBreaker {
+		cb := cp.getCircuitBreaker(addr)
+		if !cb.AllowRequest() {
+			cp.metrics.incrementFailedConnections()
+			cp.metrics.incrementError(ErrCodeConnectionFailed)
+			return nil, NewConnectionPoolError(ErrCodeConnectionFailed, fmt.Sprintf("circuit breaker is open for %s", addr), nil)
 		}
 
-		conn, err := cp.getConnectionWithCircuitBreaker(addr)
-		if err == nil {
-			return conn, nil
+		// 重试机制
+		var lastErr error
+		for attempt := 0; attempt <= cp.errorConfig.MaxRetryAttempts; attempt++ {
+			if attempt > 0 {
+				// 记录重试
+				cp.metrics.incrementRetryConnections()
+				time.Sleep(cp.errorConfig.RetryInterval)
+			}
+
+			conn, err := cp.getConnectionWithoutCircuitBreaker(addr)
+			if err == nil {
+				// 请求成功，更新熔断器
+				cb.OnSuccess()
+				return conn, nil
+			}
+
+			lastErr = err
+			// 请求失败，更新熔断器
+			cb.OnFailure()
+
+			// 检查是否应该重试
+			if !cp.shouldRetry(err, attempt) {
+				break
+			}
 		}
 
-		lastErr = err
+		cp.metrics.incrementFailedConnections()
+		return nil, lastErr
+	} else {
+		// 不启用熔断器的重试机制
+		var lastErr error
+		for attempt := 0; attempt <= cp.errorConfig.MaxRetryAttempts; attempt++ {
+			if attempt > 0 {
+				// 记录重试
+				cp.metrics.incrementRetryConnections()
+				time.Sleep(cp.errorConfig.RetryInterval)
+			}
 
-		// 检查是否应该重试
-		if !cp.shouldRetry(err, attempt) {
-			break
+			conn, err := cp.getConnectionWithoutCircuitBreaker(addr)
+			if err == nil {
+				return conn, nil
+			}
+
+			lastErr = err
+
+			// 检查是否应该重试
+			if !cp.shouldRetry(err, attempt) {
+				break
+			}
 		}
+
+		cp.metrics.incrementFailedConnections()
+		return nil, lastErr
 	}
-
-	cp.metrics.incrementFailedConnections()
-	return nil, lastErr
 }
 
-// getConnectionWithCircuitBreaker 带熔断器的获取连接
-func (cp *ConnectionPool) getConnectionWithCircuitBreaker(addr string) (*PooledConnection, error) {
-	// 检查熔断器
-	// 这里简化实现，实际应该为每个地址维护一个熔断器
-
+// getConnectionWithoutCircuitBreaker 不带熔断器的获取连接
+func (cp *ConnectionPool) getConnectionWithoutCircuitBreaker(addr string) (*command.Connection, error) {
 	// 尝试获取现有连接
 	if connValue, exists := cp.connections.Load(addr); exists {
-		conn := connValue.(*PooledConnection)
-		conn.mutex.Lock()
-		defer conn.mutex.Unlock()
+		conn := connValue.(*command.Connection)
+		conn.Mutex.Lock()
+		defer conn.Mutex.Unlock()
 
-		if !conn.closed {
-			conn.lastUsed = time.Now()
-			atomic.AddInt64(&conn.useCount, 1)
+		if !conn.Closed {
+			conn.LastUsed = time.Now()
+			// 增加使用计数
+			if countValue, ok := cp.connectionUseCount.Load(addr); ok {
+				count := countValue.(*int64)
+				atomic.AddInt64(count, 1)
+			} else {
+				count := int64(1)
+				cp.connectionUseCount.Store(addr, &count)
+			}
 			return conn, nil
 		}
 	}
@@ -247,7 +284,7 @@ func (cp *ConnectionPool) getConnectionWithCircuitBreaker(addr string) (*PooledC
 }
 
 // createConnection 创建新连接
-func (cp *ConnectionPool) createConnection(addr string) (*PooledConnection, error) {
+func (cp *ConnectionPool) createConnection(addr string) (*command.Connection, error) {
 	// Create a raw TCP connection
 	conn, err := net.DialTimeout("tcp", addr, cp.connectTimeout)
 	if err != nil {
@@ -256,84 +293,66 @@ func (cp *ConnectionPool) createConnection(addr string) (*PooledConnection, erro
 		return nil, NewConnectionPoolError(ErrCodeConnectionFailed, fmt.Sprintf("failed to connect to %s", addr), err)
 	}
 
-	// Create a pooled connection wrapper
-	pooledConn := &PooledConnection{
-		addr:        addr,
-		conn:        conn,
-		lastUsed:    time.Now(),
-		useCount:    1,
-		closed:      false,
-		createdTime: time.Now(),
+	// Create connection wrapper
+	connection := &command.Connection{
+		Addr:       addr,
+		Conn:       conn,
+		Reader:     bufio.NewReader(conn),
+		Writer:     bufio.NewWriter(conn),
+		LastUsed:   time.Now(),
+		RemoteAddr: conn.RemoteAddr().String(),
 	}
 
-	cp.connections.Store(addr, pooledConn)
+	// Store connection
+	cp.connections.Store(addr, connection)
 	atomic.AddInt32(&cp.currentCount, 1)
 
-	return pooledConn, nil
+	// 初始化使用计数
+	count := int64(1)
+	cp.connectionUseCount.Store(addr, &count)
+
+	return connection, nil
 }
 
-// SendSync 同步发送请求
-// Removed to avoid circular dependency with RemotingClient
+// ReturnConnection 归还连接
+func (cp *ConnectionPool) ReturnConnection(conn *command.Connection) {
+	// Implementation for returning connections to the pool
+	// For now, we'll just update the last used time
+	if conn != nil {
+		conn.Mutex.Lock()
+		conn.LastUsed = time.Now()
+		conn.Mutex.Unlock()
+	}
+}
 
-// SendAsync 异步发送请求
-// Removed to avoid circular dependency with RemotingClient
-
-// SendOneway 单向发送请求
-// Removed to avoid circular dependency with RemotingClient
-
-// shouldRetry 检查是否应该重试
-func (cp *ConnectionPool) shouldRetry(err error, attempt int) bool {
-	if attempt >= cp.errorConfig.MaxRetryAttempts {
-		return false
+// Close 关闭连接池
+func (cp *ConnectionPool) Close() error {
+	if !atomic.CompareAndSwapInt32(&cp.closed, 0, 1) {
+		return NewConnectionPoolError(ErrCodePoolClosed, "connection pool is already closed", nil)
 	}
 
-	// 检查错误类型
-	if poolErr, ok := err.(*ConnectionPoolError); ok {
-		// 某些错误不应该重试
-		switch poolErr.Code {
-		case ErrCodePoolClosed, ErrCodeInvalidAddress, ErrCodePoolConfigInvalid:
-			return false
-		case ErrCodeConnectionTimeout:
-			return true
+	cp.cancel()
+
+	// Close all connections
+	cp.connections.Range(func(key, value interface{}) bool {
+		if conn, ok := value.(*command.Connection); ok {
+			conn.Mutex.Lock()
+			if !conn.Closed {
+				conn.Closed = true
+				if conn.Conn != nil {
+					conn.Conn.Close()
+				}
+			}
+			conn.Mutex.Unlock()
 		}
-	}
+		cp.connections.Delete(key)
+		return true
+	})
 
-	return true
-}
+	// 等待所有goroutine结束
+	cp.wg.Wait()
 
-// IsConnected 检查是否连接到指定地址
-func (cp *ConnectionPool) IsConnected(addr string) bool {
-	connValue, exists := cp.connections.Load(addr)
-	if !exists {
-		return false
-	}
-
-	conn := connValue.(*PooledConnection)
-	conn.mutex.RLock()
-	defer conn.mutex.RUnlock()
-
-	return !conn.closed && conn.conn != nil
-}
-
-// RemoveConnection 移除连接
-func (cp *ConnectionPool) RemoveConnection(addr string) {
-	connValue, exists := cp.connections.Load(addr)
-	if !exists {
-		return
-	}
-
-	conn := connValue.(*PooledConnection)
-	conn.mutex.Lock()
-	defer conn.mutex.Unlock()
-
-	if !conn.closed {
-		conn.closed = true
-		if conn.conn != nil {
-			conn.conn.Close()
-		}
-		cp.connections.Delete(addr)
-		atomic.AddInt32(&cp.currentCount, -1)
-	}
+	return nil
 }
 
 // cleanupRoutine 清理例程
@@ -346,195 +365,85 @@ func (cp *ConnectionPool) cleanupRoutine() {
 	for {
 		select {
 		case <-ticker.C:
-			cp.cleanupIdleConnections()
+			cp.cleanupConnections()
 		case <-cp.ctx.Done():
 			return
 		}
 	}
 }
 
-// cleanupIdleConnections 清理空闲连接
-func (cp *ConnectionPool) cleanupIdleConnections() {
+// cleanupConnections 清理过期连接
+func (cp *ConnectionPool) cleanupConnections() {
 	now := time.Now()
-	var toRemove []string
-
 	cp.connections.Range(func(key, value interface{}) bool {
 		addr := key.(string)
-		conn := value.(*PooledConnection)
+		conn := value.(*command.Connection)
+		conn.Mutex.RLock()
+		lastUsed := conn.LastUsed
+		closed := conn.Closed
+		conn.Mutex.RUnlock()
 
-		conn.mutex.RLock()
-		lastUsed := conn.lastUsed
-		closed := conn.closed
-		conn.mutex.RUnlock()
-
-		// 检查是否需要清理
 		if closed || now.Sub(lastUsed) > cp.maxIdleTime {
-			toRemove = append(toRemove, addr)
-		}
-
-		return true
-	})
-
-	// 移除空闲连接
-	for _, addr := range toRemove {
-		cp.RemoveConnection(addr)
-	}
-}
-
-// GetConnectionStats 获取连接统计信息
-func (cp *ConnectionPool) GetConnectionStats() map[string]interface{} {
-	stats := make(map[string]interface{})
-	stats["current_count"] = atomic.LoadInt32(&cp.currentCount)
-	stats["max_connections"] = cp.maxConnections
-	stats["max_idle_time"] = cp.maxIdleTime.String()
-	stats["connect_timeout"] = cp.connectTimeout.String()
-	stats["request_timeout"] = cp.requestTimeout.String()
-
-	// 连接详情
-	connections := make([]map[string]interface{}, 0)
-	cp.connections.Range(func(key, value interface{}) bool {
-		addr := key.(string)
-		conn := value.(*PooledConnection)
-
-		conn.mutex.RLock()
-		connInfo := map[string]interface{}{
-			"addr":         addr,
-			"last_used":    conn.lastUsed.Format(time.RFC3339),
-			"use_count":    atomic.LoadInt64(&conn.useCount),
-			"closed":       conn.closed,
-			"created_time": conn.createdTime.Format(time.RFC3339),
-			"age":          time.Since(conn.createdTime).String(),
-		}
-		conn.mutex.RUnlock()
-
-		connections = append(connections, connInfo)
-		return true
-	})
-	stats["connections"] = connections
-
-	return stats
-}
-
-// Close 关闭连接池
-func (cp *ConnectionPool) Close() error {
-	if !atomic.CompareAndSwapInt32(&cp.closed, 0, 1) {
-		return NewConnectionPoolError(ErrCodePoolClosed, "connection pool is already closed", nil)
-	}
-
-	cp.cancel()
-
-	// 关闭所有连接
-	cp.connections.Range(func(key, value interface{}) bool {
-		conn := value.(*PooledConnection)
-		conn.mutex.Lock()
-		if !conn.closed {
-			conn.closed = true
-			if conn.conn != nil {
-				conn.conn.Close()
+			cp.connections.Delete(key)
+			// Close the connection
+			conn.Mutex.Lock()
+			if !conn.Closed {
+				conn.Closed = true
+				if conn.Conn != nil {
+					conn.Conn.Close()
+				}
 			}
+			conn.Mutex.Unlock()
+			atomic.AddInt32(&cp.currentCount, -1)
+			// Remove use count
+			cp.connectionUseCount.Delete(addr)
 		}
-		conn.mutex.Unlock()
 		return true
 	})
-
-	// 等待清理goroutine结束
-	cp.wg.Wait()
-
-	return nil
 }
 
-// GetConnectionCount 获取当前连接数
-func (cp *ConnectionPool) GetConnectionCount() int32 {
-	return atomic.LoadInt32(&cp.currentCount)
-}
-
-// GetMaxConnections 获取最大连接数
-func (cp *ConnectionPool) GetMaxConnections() int32 {
-	return cp.maxConnections
-}
-
-// SetMaxConnections 设置最大连接数
-func (cp *ConnectionPool) SetMaxConnections(max int32) error {
-	if max <= 0 {
-		return NewConnectionPoolError(ErrCodePoolConfigInvalid, "max connections must be positive", nil)
-	}
-	atomic.StoreInt32(&cp.maxConnections, max)
-	return nil
-}
-
-// GetMaxIdleTime 获取最大空闲时间
-func (cp *ConnectionPool) GetMaxIdleTime() time.Duration {
-	return cp.maxIdleTime
-}
-
-// SetMaxIdleTime 设置最大空闲时间
-func (cp *ConnectionPool) SetMaxIdleTime(duration time.Duration) error {
-	if duration <= 0 {
-		return NewConnectionPoolError(ErrCodePoolConfigInvalid, "idle time must be positive", nil)
-	}
-	cp.maxIdleTime = duration
-	return nil
-}
-
-// GetConnectTimeout 获取连接超时
-func (cp *ConnectionPool) GetConnectTimeout() time.Duration {
-	return cp.connectTimeout
-}
-
-// SetConnectTimeout 设置连接超时
-func (cp *ConnectionPool) SetConnectTimeout(timeout time.Duration) error {
-	if timeout <= 0 {
-		return NewConnectionPoolError(ErrCodePoolConfigInvalid, "connect timeout must be positive", nil)
-	}
-	cp.connectTimeout = timeout
-	return nil
-}
-
-// GetRequestTimeout 获取请求超时
-func (cp *ConnectionPool) GetRequestTimeout() time.Duration {
-	return cp.requestTimeout
-}
-
-// SetRequestTimeout 设置请求超时
-func (cp *ConnectionPool) SetRequestTimeout(timeout time.Duration) error {
-	if timeout <= 0 {
-		return NewConnectionPoolError(ErrCodePoolConfigInvalid, "request timeout must be positive", nil)
-	}
-	cp.requestTimeout = timeout
-	return nil
-}
-
-// TestConnection 测试连接
-func (cp *ConnectionPool) TestConnection(addr string) error {
-	conn, err := cp.GetConnection(addr)
-	if err != nil {
-		return err
+// getCircuitBreaker 获取熔断器
+func (cp *ConnectionPool) getCircuitBreaker(addr string) *CircuitBreaker {
+	if cbValue, exists := cp.circuitBreakers.Load(addr); exists {
+		return cbValue.(*CircuitBreaker)
 	}
 
-	// Test the connection by checking if it is still alive
-	// For now, we just check if the connection is not nil and not closed
-	if conn.conn == nil {
-		return NewConnectionPoolError(ErrCodeConnectionFailed, "connection is nil", nil)
-	}
-
-	return nil
+	cb := NewCircuitBreaker(cp.errorConfig.CircuitBreakerThreshold, cp.errorConfig.CircuitBreakerTimeout)
+	cp.circuitBreakers.Store(addr, cb)
+	return cb
 }
 
-// WarmupConnections 预热连接
-func (cp *ConnectionPool) WarmupConnections(addrs []string) error {
-	var errors []error
+// shouldRetry 检查是否应该重试
+func (cp *ConnectionPool) shouldRetry(err error, attempt int) bool {
+	if attempt >= cp.errorConfig.MaxRetryAttempts {
+		return false
+	}
 
-	for _, addr := range addrs {
-		if err := cp.TestConnection(addr); err != nil {
-			errors = append(errors, fmt.Errorf("failed to warmup connection to %s: %v", addr, err))
+	// 检查错误类型
+	if connErr, ok := err.(*ConnectionPoolError); ok {
+		// 某些错误不应该重试
+		switch connErr.Code {
+		case ErrCodeInvalidAddress, ErrCodePoolClosed, ErrCodePoolFull:
+			return false
+		case ErrCodeConnectionTimeout:
+			return true
 		}
 	}
 
-	if len(errors) > 0 {
-		return fmt.Errorf("warmup failed for %d connections: %v", len(errors), errors)
-	}
+	// 对于其他错误，默认重试
+	return true
+}
 
-	return nil
+// IsConnected 检查是否连接到指定地址
+func (cp *ConnectionPool) IsConnected(addr string) bool {
+	if connValue, exists := cp.connections.Load(addr); exists {
+		conn := connValue.(*command.Connection)
+		conn.Mutex.RLock()
+		closed := conn.Closed
+		conn.Mutex.RUnlock()
+		return !closed
+	}
+	return false
 }
 
 // Connection pool metrics methods
@@ -544,21 +453,33 @@ func (cm *ConnectionPoolMetrics) incrementTotalConnections() {
 	cm.mutex.Unlock()
 }
 
+func (cm *ConnectionPoolMetrics) incrementActiveConnections() {
+	cm.mutex.Lock()
+	cm.ActiveConnections++
+	cm.mutex.Unlock()
+}
+
+func (cm *ConnectionPoolMetrics) decrementActiveConnections() {
+	cm.mutex.Lock()
+	cm.ActiveConnections--
+	cm.mutex.Unlock()
+}
+
 func (cm *ConnectionPoolMetrics) incrementFailedConnections() {
 	cm.mutex.Lock()
 	cm.FailedConnections++
 	cm.mutex.Unlock()
 }
 
-func (cm *ConnectionPoolMetrics) incrementRetryConnections() {
+func (cm *ConnectionPoolMetrics) incrementTimeoutConnections() {
 	cm.mutex.Lock()
-	cm.RetryConnections++
+	cm.TimeoutConnections++
 	cm.mutex.Unlock()
 }
 
-func (cm *ConnectionPoolMetrics) incrementError(code int) {
+func (cm *ConnectionPoolMetrics) incrementRetryConnections() {
 	cm.mutex.Lock()
-	cm.ErrorCountByCode[code]++
+	cm.RetryConnections++
 	cm.mutex.Unlock()
 }
 
@@ -572,26 +493,84 @@ func (cm *ConnectionPoolMetrics) updateConnectionTime(latency time.Duration) {
 	cm.mutex.Unlock()
 }
 
-// GetPoolStats 获取连接池统计信息
-func (cm *ConnectionPoolMetrics) GetPoolStats() map[string]interface{} {
-	cm.mutex.RLock()
-	defer cm.mutex.RUnlock()
+func (cm *ConnectionPoolMetrics) incrementError(code int) {
+	cm.mutex.Lock()
+	cm.ErrorCountByCode[code]++
+	cm.mutex.Unlock()
+}
 
-	stats := map[string]interface{}{
-		"total_connections":      cm.TotalConnections,
-		"active_connections":     cm.ActiveConnections,
-		"failed_connections":     cm.FailedConnections,
-		"timeout_connections":    cm.TimeoutConnections,
-		"retry_connections":      cm.RetryConnections,
-		"avg_connection_time_ms": cm.AvgConnectionTime.Milliseconds(),
+// GetStats 获取连接池统计信息
+func (cp *ConnectionPool) GetStats() map[string]interface{} {
+	cp.metrics.mutex.RLock()
+	defer cp.metrics.mutex.RUnlock()
+
+	return map[string]interface{}{
+		"total_connections":   cp.metrics.TotalConnections,
+		"active_connections":  cp.metrics.ActiveConnections,
+		"failed_connections":  cp.metrics.FailedConnections,
+		"timeout_connections": cp.metrics.TimeoutConnections,
+		"retry_connections":   cp.metrics.RetryConnections,
+		"avg_connection_time": cp.metrics.AvgConnectionTime.Milliseconds(),
+		"error_count_by_code": cp.metrics.ErrorCountByCode,
+	}
+}
+
+// CircuitBreaker 熔断器
+type CircuitBreaker struct {
+	failures    int32
+	lastFailure time.Time
+	open        bool
+	mutex       sync.RWMutex
+	threshold   int
+	timeout     time.Duration
+}
+
+// NewCircuitBreaker 创建熔断器
+func NewCircuitBreaker(threshold int, timeout time.Duration) *CircuitBreaker {
+	return &CircuitBreaker{
+		threshold: threshold,
+		timeout:   timeout,
+	}
+}
+
+// AllowRequest 检查是否允许请求
+func (cb *CircuitBreaker) AllowRequest() bool {
+	cb.mutex.RLock()
+	defer cb.mutex.RUnlock()
+
+	if !cb.open {
+		return true
 	}
 
-	// 添加错误统计
-	errorStats := make(map[string]int64)
-	for code, count := range cm.ErrorCountByCode {
-		errorStats[fmt.Sprintf("error_%d", code)] = count
+	// 检查是否应该半开
+	if time.Since(cb.lastFailure) > cb.timeout {
+		cb.mutex.Lock()
+		cb.open = false
+		cb.mutex.Unlock()
+		return true
 	}
-	stats["errors"] = errorStats
 
-	return stats
+	return false
+}
+
+// OnSuccess 记录成功
+func (cb *CircuitBreaker) OnSuccess() {
+	cb.mutex.Lock()
+	defer cb.mutex.Unlock()
+
+	cb.failures = 0
+	cb.open = false
+}
+
+// OnFailure 记录失败
+func (cb *CircuitBreaker) OnFailure() {
+	cb.mutex.Lock()
+	defer cb.mutex.Unlock()
+
+	cb.failures++
+	cb.lastFailure = time.Now()
+
+	if int(cb.failures) >= cb.threshold {
+		cb.open = true
+	}
 }
