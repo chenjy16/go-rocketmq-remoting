@@ -3,7 +3,10 @@ package connection
 import (
 	"bufio"
 	"context"
+	"crypto/tls"
+	"crypto/x509"
 	"fmt"
+	"io/ioutil"
 	"net"
 	"sync"
 	"sync/atomic"
@@ -78,6 +81,9 @@ type ConnectionPool struct {
 
 	// 连接使用计数
 	connectionUseCount sync.Map // map[string]*int64
+
+	// 配置
+	config *ConnectionPoolConfig
 }
 
 // ConnectionPoolErrorConfig 连接池错误处理配置
@@ -116,6 +122,18 @@ type ConnectionPoolConfig struct {
 	MaxIdleTime    time.Duration // 最大空闲时间
 	ConnectTimeout time.Duration // 连接超时
 	RequestTimeout time.Duration // 请求超时
+	// TLS配置
+	TLSConfig *TLSConfig // TLS配置
+}
+
+// TLSConfig TLS配置
+type TLSConfig struct {
+	EnableTLS  bool   // 是否启用TLS
+	CertFile   string // 证书文件路径
+	KeyFile    string // 私钥文件路径
+	CAFile     string // CA证书文件路径
+	ServerName string // 服务器名称
+	SkipVerify bool   // 是否跳过证书验证
 }
 
 // DefaultConnectionPoolConfig 默认连接池配置
@@ -125,6 +143,7 @@ func DefaultConnectionPoolConfig() *ConnectionPoolConfig {
 		MaxIdleTime:    5 * time.Minute,
 		ConnectTimeout: 3 * time.Second,
 		RequestTimeout: 30 * time.Second,
+		TLSConfig:      &TLSConfig{EnableTLS: false}, // 默认不启用TLS
 	}
 }
 
@@ -161,6 +180,8 @@ func NewConnectionPool(config *ConnectionPoolConfig) *ConnectionPool {
 		metrics: &ConnectionPoolMetrics{
 			ErrorCountByCode: make(map[int]int64),
 		},
+		// 配置
+		config: config,
 	}
 
 	// 启动清理goroutine
@@ -275,7 +296,7 @@ func (cp *ConnectionPool) getConnectionWithoutCircuitBreaker(addr string) (*comm
 	}
 
 	// 检查连接数限制
-	if atomic.LoadInt32(&cp.currentCount) >= cp.maxConnections {
+	if atomic.LoadInt32(&cp.currentCount) >= cp.config.MaxConnections {
 		return nil, NewConnectionPoolError(ErrCodePoolFull, "connection pool is full", nil)
 	}
 
@@ -285,8 +306,18 @@ func (cp *ConnectionPool) getConnectionWithoutCircuitBreaker(addr string) (*comm
 
 // createConnection 创建新连接
 func (cp *ConnectionPool) createConnection(addr string) (*command.Connection, error) {
-	// Create a raw TCP connection
-	conn, err := net.DialTimeout("tcp", addr, cp.connectTimeout)
+	var conn net.Conn
+	var err error
+
+	// Check if TLS is enabled
+	if cp.config.TLSConfig != nil && cp.config.TLSConfig.EnableTLS {
+		// Create TLS connection
+		conn, err = cp.createTLSConnection(addr)
+	} else {
+		// Create regular TCP connection
+		conn, err = net.DialTimeout("tcp", addr, cp.config.ConnectTimeout)
+	}
+
 	if err != nil {
 		cp.metrics.incrementFailedConnections()
 		cp.metrics.incrementError(ErrCodeConnectionFailed)
@@ -312,6 +343,76 @@ func (cp *ConnectionPool) createConnection(addr string) (*command.Connection, er
 	cp.connectionUseCount.Store(addr, &count)
 
 	return connection, nil
+}
+
+// createTLSConnection 创建TLS连接
+func (cp *ConnectionPool) createTLSConnection(addr string) (net.Conn, error) {
+	// 解析地址
+	host, _, err := net.SplitHostPort(addr)
+	if err != nil {
+		return nil, err
+	}
+
+	// 创建TCP连接
+	tcpConn, err := net.DialTimeout("tcp", addr, cp.config.ConnectTimeout)
+	if err != nil {
+		return nil, err
+	}
+
+	// 配置TLS
+	tlsConfig := &tls.Config{
+		ServerName:         host,
+		InsecureSkipVerify: cp.config.TLSConfig.SkipVerify,
+	}
+
+	// 如果提供了证书文件，加载证书
+	if cp.config.TLSConfig.CertFile != "" && cp.config.TLSConfig.KeyFile != "" {
+		cert, err := tls.LoadX509KeyPair(cp.config.TLSConfig.CertFile, cp.config.TLSConfig.KeyFile)
+		if err != nil {
+			tcpConn.Close()
+			return nil, fmt.Errorf("failed to load TLS certificate: %v", err)
+		}
+		tlsConfig.Certificates = []tls.Certificate{cert}
+	}
+
+	// 如果提供了CA文件，加载CA证书
+	if cp.config.TLSConfig.CAFile != "" {
+		caCert, err := ioutil.ReadFile(cp.config.TLSConfig.CAFile)
+		if err != nil {
+			tcpConn.Close()
+			return nil, fmt.Errorf("failed to read CA certificate: %v", err)
+		}
+		caCertPool := x509.NewCertPool()
+		caCertPool.AppendCertsFromPEM(caCert)
+		tlsConfig.RootCAs = caCertPool
+	}
+
+	// 如果指定了服务器名称，使用它
+	if cp.config.TLSConfig.ServerName != "" {
+		tlsConfig.ServerName = cp.config.TLSConfig.ServerName
+	}
+
+	// 创建TLS连接
+	tlsConn := tls.Client(tcpConn, tlsConfig)
+
+	// 设置握手超时
+	errChan := make(chan error, 1)
+	go func() {
+		errChan <- tlsConn.Handshake()
+	}()
+
+	select {
+	case err := <-errChan:
+		if err != nil {
+			tcpConn.Close()
+			return nil, fmt.Errorf("TLS handshake failed: %v", err)
+		}
+	case <-time.After(cp.config.ConnectTimeout):
+		tcpConn.Close()
+		return nil, fmt.Errorf("TLS handshake timeout")
+	}
+
+	return tlsConn, nil
 }
 
 // ReturnConnection 归还连接
